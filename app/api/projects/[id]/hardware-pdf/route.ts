@@ -1,0 +1,210 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { withProjectAuth } from '@/lib/auth/api-helpers';
+import type { AuthContext, RouteParams } from '@/lib/auth/api-helpers';
+import { extractHardwareSetsFromPdf } from '@/services/hardwarePdfServiceV2';
+import { generatePrepForAllSets } from '@/services/hardwarePrepService';
+import { upsertHardwarePdfExtraction, getHardwarePdfExtraction } from '@/lib/db/hardware';
+import type { ExtractedHardwareSet } from '@/lib/db/hardware';
+import { queueItemsForApproval } from '@/lib/db/masterHardware';
+
+export const GET = withProjectAuth(
+  async (_req: NextRequest, _ctx: AuthContext, params?: RouteParams) => {
+    const projectId = params?.id as string;
+    const { data, error } = await getHardwarePdfExtraction(projectId);
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ data });
+  },
+);
+
+// Large PDFs can take up to 5 minutes through Tier 2 text extraction
+export const maxDuration = 300;
+
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
+
+export const POST = withProjectAuth(
+  async (req: NextRequest, ctx: AuthContext, params?: RouteParams) => {
+    const projectId = params?.id as string;
+
+    // Accepts multipart/form-data with a single field named "file" (PDF).
+    // The raw PDF buffer is sent directly to OpenRouter — no client-side
+    // text extraction needed.
+    let formData: FormData;
+    try {
+      formData = await req.formData();
+    } catch {
+      return NextResponse.json({ error: 'Invalid multipart form data.' }, { status: 400 });
+    }
+
+    const file = formData.get('file');
+    if (!(file instanceof File)) {
+      return NextResponse.json(
+        { error: 'No file provided. Send a multipart field named "file".' },
+        { status: 400 },
+      );
+    }
+
+    if (file.size > MAX_FILE_SIZE) {
+      return NextResponse.json(
+        { error: 'File too large. Maximum size is 50 MB.' },
+        { status: 413 },
+      );
+    }
+
+    const filename = file.name;
+    const ext = filename.split('.').pop()?.toLowerCase();
+    if (ext !== 'pdf') {
+      return NextResponse.json(
+        { error: 'Unsupported file type. Please upload a PDF file.' },
+        { status: 415 },
+      );
+    }
+
+    const buffer = Buffer.from(await file.arrayBuffer());
+
+    let result;
+    try {
+      result = await extractHardwareSetsFromPdf(buffer, filename, projectId);
+    } catch (err) {
+      return NextResponse.json(
+        { error: `PDF processing failed: ${err instanceof Error ? err.message : String(err)}` },
+        { status: 422 },
+      );
+    }
+
+    if (result.setCount === 0) {
+      return NextResponse.json(
+        { error: 'No hardware sets were found. Check that this is a Division 08 hardware schedule PDF.' },
+        { status: 422 },
+      );
+    }
+
+    // Generate hardware prep for all sets in a single AI call.
+    // Failures are non-fatal — sets that fail get no prep (the UI will show the fallback button).
+    const apiKeyPresent = Boolean(process.env.OPENROUTER_API_KEY);
+    console.log(`[hw-pdf:prep] Starting prep generation — sets=${result.sets.length}  apiKeyPresent=${apiKeyPresent}`);
+    const prepStart = Date.now();
+    let prepMap: Record<string, string> = {};
+    try {
+      prepMap = await generatePrepForAllSets(result.sets);
+      console.log(
+        `[hw-pdf:prep] Prep generation done in ${Date.now() - prepStart}ms — ` +
+        `got=${Object.keys(prepMap).length}/${result.sets.length}  keys=${JSON.stringify(Object.keys(prepMap))}`,
+      );
+    } catch (prepErr) {
+      console.error('[hw-pdf:prep] Prep generation threw (non-fatal):', prepErr);
+    }
+
+    // Attach prep to each set (sets with no prep entry get prep: undefined)
+    const setsWithPrep: ExtractedHardwareSet[] = result.sets.map(set => ({
+      ...set,
+      prep: prepMap[set.setName],
+    }));
+    console.log('[hw-pdf:prep] Prep values per set:', setsWithPrep.map(s => ({ name: s.setName, prep: s.prep ?? 'MISSING' })));
+
+    const { data, error } = await upsertHardwarePdfExtraction(projectId, {
+      extractedJson: setsWithPrep,
+      fileName: filename,
+      uploadedBy: ctx.user.id,
+    });
+
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+
+    // Queue new unique items into the master hardware pending table.
+    // Must be awaited — serverless functions terminate once the response is sent,
+    // so fire-and-forget (.then()) would be silently dropped.
+    console.log(`[hw-pdf:master] Starting queue step — sets=${setsWithPrep.length}  totalItems=${result.itemCount}`);
+
+    // Log the raw shape of the first set so we can verify field names
+    if (setsWithPrep.length > 0) {
+      const firstSet = setsWithPrep[0];
+      console.log('[hw-pdf:master] First set sample:', JSON.stringify({
+        setName: firstSet.setName,
+        itemCount: firstSet.hardwareItems?.length ?? 0,
+        firstItem: firstSet.hardwareItems?.[0] ?? null,
+        hasPrep: Boolean(firstSet.prep),
+      }));
+    }
+
+    const candidateItems = setsWithPrep
+      .flatMap(set =>
+        (set.hardwareItems ?? []).map(item => ({
+          name: (item.item ?? '').trim(),
+          manufacturer: (item.manufacturer ?? '').trim(),
+          description: (item.description ?? '').trim(),
+          finish: (item.finish ?? '').trim(),
+        })),
+      )
+      .filter(item => item.name.length > 0); // skip blank item names
+
+    console.log(`[hw-pdf:master] Candidates after flattening and filtering blanks: ${candidateItems.length}`);
+
+    let queuedCount = 0;
+    let skippedCount = 0;
+    let queueWarning: string | null = null;
+    if (candidateItems.length > 0) {
+      const queueResult = await queueItemsForApproval(
+        candidateItems,
+        projectId,
+        filename,
+        ctx.user.id,
+      );
+      if (queueResult.data) {
+        queuedCount = queueResult.data.queued;
+        skippedCount = queueResult.data.skipped;
+      } else {
+        queueWarning = queueResult.error?.message ?? 'Unknown queue error';
+        console.error('[hw-pdf:master] queueItemsForApproval returned error:', queueWarning);
+      }
+    } else {
+      queueWarning = 'No queue candidates were generated from the extracted hardware items.';
+      console.warn('[hw-pdf:master] candidateItems is empty — nothing queued. Check that hardwareItems[].item field is non-blank.');
+    }
+
+    console.log(
+      `[hardware-pdf] Saved → project=${projectId}  file="${filename}"  ` +
+      `sets=${result.setCount}  items=${result.itemCount}  tier=${result.tier}  ` +
+      `db_id=${data!.id}  duration=${result.durationMs}ms  ` +
+      `master-queued=${queuedCount}  master-skipped=${skippedCount}`,
+    );
+
+    return NextResponse.json({
+      data: {
+        id: data!.id,
+        setCount: result.setCount,
+        itemCount: result.itemCount,
+        durationMs: result.durationMs,
+        tier: result.tier,
+        warnings: result.warnings,
+        masterQueued: queuedCount,
+        masterSkipped: skippedCount,
+        masterQueueWarning: queueWarning,
+      },
+    });
+  },
+);
+
+// Patch the stored extraction with an updated set list (e.g. after a variant is created).
+// Only updates extractedJson — fileName / uploadedBy are preserved from the existing row.
+export const PUT = withProjectAuth(
+  async (req: NextRequest, _ctx: AuthContext, params?: RouteParams) => {
+    const projectId = params?.id as string;
+
+    let body: { extractedJson?: ExtractedHardwareSet[] };
+    try {
+      body = await req.json() as { extractedJson?: ExtractedHardwareSet[] };
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 });
+    }
+
+    if (!Array.isArray(body.extractedJson)) {
+      return NextResponse.json({ error: 'extractedJson must be an array.' }, { status: 400 });
+    }
+
+    const { data, error } = await upsertHardwarePdfExtraction(projectId, {
+      extractedJson: body.extractedJson,
+    });
+
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ data: { id: data!.id, setCount: body.extractedJson.length } });
+  },
+);

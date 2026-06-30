@@ -1,0 +1,360 @@
+/**
+ * POST /api/projects/[id]/process
+ *
+ * Combined upload endpoint: accepts both an Excel door schedule (.xlsx) and a
+ * hardware PDF in one request, processes them sequentially, merges the result,
+ * and persists the final JSON to project_hardware_finals.
+ *
+ * Form fields:
+ *   - excel  — .xlsx file (door schedule)
+ *   - pdf    — .pdf file  (hardware spec)
+ *
+ * Cancellation: all AI work runs first; DB writes only happen after all AI
+ * succeeds. If the client aborts (req.signal) during AI processing, nothing is
+ * written to the database, leaving the project in its prior state.
+ */
+
+import { NextRequest, NextResponse } from 'next/server';
+import fs from 'fs';
+import path from 'path';
+import { withProjectAuth } from '@/lib/auth/api-helpers';
+import type { AuthContext, RouteParams } from '@/lib/auth/api-helpers';
+import { parseDoorSchedule } from '@/services/doorScheduleService';
+import type { DoorScheduleResult } from '@/services/doorScheduleService';
+import { extractDoorScheduleFromPdf } from '@/services/doorSchedulePdfService';
+import { extractHardwareSetsFromPdf } from '@/services/hardwarePdfServiceV2';
+import { generatePrepForAllSets } from '@/services/hardwarePrepService';
+import {
+  upsertDoorScheduleImport,
+  upsertHardwarePdfExtraction,
+  upsertProjectHardwareFinal,
+} from '@/lib/db/hardware';
+import { invalidateDoorSchedule } from '@/lib/cache/doorSchedule';
+import type { ExtractedHardwareSet } from '@/lib/db/hardware';
+import { mergeHardwareData } from '@/services/mergeService';
+import { queueItemsForApproval } from '@/lib/db/masterHardware';
+import { acquireProcessingLock, releaseProcessingLock } from '@/lib/db/processingLock';
+import { createSupabaseAdminClient } from '@/lib/supabase/admin';
+
+export const maxDuration = 300;
+
+/**
+ * DELETE /api/projects/[id]/process
+ *
+ * Releases any processing lock held for this project. Called by the client
+ * when the user explicitly cancels — ensures the lock is cleared even if
+ * Vercel killed the Lambda before the POST handler's finally block could run.
+ */
+export const DELETE = withProjectAuth(
+  async (_req: NextRequest, _ctx: AuthContext, params?: RouteParams) => {
+    const projectId = params?.id as string;
+    await releaseProcessingLock(projectId);
+    return NextResponse.json({ ok: true });
+  },
+);
+
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
+
+function saveExcelDebugFiles(projectId: string, filename: string, result: DoorScheduleResult): void {
+  if (process.env.NODE_ENV !== 'development') return;
+  try {
+    const debugDir = path.join(process.cwd(), 'debug-extractions', 'excel-extraction');
+    fs.mkdirSync(debugDir, { recursive: true });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const prefix = `${projectId.slice(0, 8)}_${timestamp}`;
+    fs.writeFileSync(
+      path.join(debugDir, `${prefix}_parsed.json`),
+      JSON.stringify(result.rows, null, 2),
+      'utf-8',
+    );
+    fs.writeFileSync(
+      path.join(debugDir, `${prefix}_meta.json`),
+      JSON.stringify({ fileName: filename, rowCount: result.rowCount, warnings: result.warnings }, null, 2),
+      'utf-8',
+    );
+    console.log(`[process] Excel debug files → debug-extractions/excel-extraction/${prefix}_*`);
+  } catch (err) {
+    console.error('[process] Excel debug write FAILED — path:', path.join(process.cwd(), 'debug-extractions', 'excel-extraction'), '— error:', err);
+  }
+}
+
+export const POST = withProjectAuth(
+  async (req: NextRequest, ctx: AuthContext, params?: RouteParams) => {
+    const projectId = params?.id as string;
+    const { signal } = req;
+
+    // ── Parse multipart form ───────────────────────────────────────────────
+    let formData: FormData;
+    try {
+      formData = await req.formData();
+    } catch {
+      return NextResponse.json({ error: 'Invalid multipart form data.' }, { status: 400 });
+    }
+
+    const scheduleField = formData.get('excel');
+    const pdfField = formData.get('pdf');
+    const pdfStoragePathField = formData.get('pdfStoragePath');
+    const pdfNameField = formData.get('pdfName');
+
+    if (!(scheduleField instanceof File)) {
+      return NextResponse.json(
+        { error: 'Missing "excel" field. Send the door schedule as a multipart field named "excel".' },
+        { status: 400 },
+      );
+    }
+
+    const hasPdfFile = pdfField instanceof File;
+    const hasPdfStoragePath = typeof pdfStoragePathField === 'string' && pdfStoragePathField.length > 0;
+
+    if (!hasPdfFile && !hasPdfStoragePath) {
+      return NextResponse.json(
+        { error: 'Missing hardware PDF. Send it as a "pdf" field, or upload it to storage first and provide "pdfStoragePath".' },
+        { status: 400 },
+      );
+    }
+
+    if (scheduleField.size > MAX_FILE_SIZE) {
+      return NextResponse.json({ error: 'Door schedule file too large. Maximum size is 50 MB.' }, { status: 413 });
+    }
+    if (hasPdfFile && (pdfField as File).size > MAX_FILE_SIZE) {
+      return NextResponse.json({ error: 'Hardware PDF too large. Maximum size is 50 MB.' }, { status: 413 });
+    }
+
+    // ── Processing lock ────────────────────────────────────────────────────
+    // Prevents two simultaneous jobs for the same project (e.g. two tabs, page
+    // refresh mid-upload). The lock is always released in the finally block below,
+    // so cancel and error paths never leave a project permanently blocked.
+    const lockId = crypto.randomUUID();
+    const lockResult = await acquireProcessingLock(projectId, lockId);
+    if (lockResult.acquired === false) {
+      const wait = lockResult.ageSeconds > 0 ? ` (started ${lockResult.ageSeconds}s ago)` : '';
+      return NextResponse.json(
+        { error: `This project is already being processed${wait}. Please wait for it to finish or cancel the in-progress job.` },
+        { status: 429 },
+      );
+    }
+
+    // Tracks the storage path when the PDF arrived via Supabase Storage (large-file path).
+    // Set inside the try block; read by finally to delete the temp file after processing.
+    let tempPdfStoragePath: string | null = null;
+
+    try {
+    // ── Phase 1: Parse & AI — NO database writes yet ──────────────────────
+    // All DB writes are deferred until after all AI work succeeds.
+    // This ensures a user cancel during AI leaves the project in its prior state.
+
+    // Step 1a: Parse door schedule (Excel OR PDF) ──────────────────────────
+    const scheduleBuffer = Buffer.from(await scheduleField.arrayBuffer());
+    const scheduleExt = (scheduleField.name.split('.').pop() ?? '').toLowerCase();
+    const scheduleIsPdf = scheduleExt === 'pdf';
+
+    let scheduleResult;
+    try {
+      if (scheduleIsPdf) {
+        console.log(`[process] Door schedule is a PDF — using AI extraction (file="${scheduleField.name}")`);
+        scheduleResult = await extractDoorScheduleFromPdf(scheduleBuffer, scheduleField.name, projectId);
+      } else {
+        scheduleResult = parseDoorSchedule(scheduleBuffer, scheduleField.name);
+      }
+    } catch (err) {
+      return NextResponse.json(
+        { error: `Failed to parse door schedule: ${err instanceof Error ? err.message : String(err)}` },
+        { status: 422 },
+      );
+    }
+
+    if (!scheduleIsPdf) saveExcelDebugFiles(projectId, scheduleField.name, scheduleResult);
+
+    if (scheduleResult.rowCount === 0) {
+      return NextResponse.json(
+        { error: scheduleIsPdf
+            ? 'No door rows found in the PDF. Verify this is a door schedule document with a Door Tag column.'
+            : 'No door rows found in the Excel file. Check that the sheet has a "DOOR TAG" column.' },
+        { status: 422 },
+      );
+    }
+
+    // Step 1b: Extract hardware sets from PDF (AI) ─────────────────────────
+    if (signal.aborted) return NextResponse.json({ error: 'Cancelled.' }, { status: 499 });
+
+    let pdfBuffer: Buffer;
+    let pdfFileName: string;
+
+    if (hasPdfStoragePath) {
+      // Large-file path: PDF was uploaded directly to Supabase Storage by the client
+      // to bypass Vercel's 4.5 MB request-body limit. Download it here using the
+      // service-role key (bypasses RLS), then delete it in the finally block.
+      tempPdfStoragePath = pdfStoragePathField as string;
+      const adminClient = createSupabaseAdminClient();
+      const { data: storageBlob, error: storageError } = await adminClient.storage
+        .from('temp-pdf-uploads')
+        .download(tempPdfStoragePath);
+      if (storageError || !storageBlob) {
+        return NextResponse.json(
+          { error: 'Could not retrieve your uploaded PDF from storage. Please try uploading again.' },
+          { status: 500 },
+        );
+      }
+      pdfBuffer = Buffer.from(await storageBlob.arrayBuffer());
+      pdfFileName = typeof pdfNameField === 'string' && pdfNameField
+        ? pdfNameField
+        : tempPdfStoragePath.split('/').pop() ?? 'hardware.pdf';
+    } else {
+      pdfBuffer = Buffer.from(await (pdfField as File).arrayBuffer());
+      pdfFileName = (pdfField as File).name;
+    }
+
+    let pdfResult;
+    try {
+      pdfResult = await extractHardwareSetsFromPdf(pdfBuffer, pdfFileName, projectId, signal);
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        return NextResponse.json({ error: 'Cancelled.' }, { status: 499 });
+      }
+      return NextResponse.json(
+        { error: `PDF processing failed: ${err instanceof Error ? err.message : String(err)}` },
+        { status: 422 },
+      );
+    }
+
+    if (pdfResult.setCount === 0) {
+      if (pdfResult.warnings.length > 0) {
+        console.error(`[process] PDF extraction returned 0 sets — warnings: ${pdfResult.warnings.join(' | ')}`);
+      }
+      return NextResponse.json(
+        { error: 'No hardware sets were found in the PDF. Please verify this is a Division 08 hardware schedule PDF and try again.' },
+        { status: 422 },
+      );
+    }
+
+    // Step 1c: Generate hardware prep function strings (AI) ────────────────
+    if (signal.aborted) return NextResponse.json({ error: 'Cancelled.' }, { status: 499 });
+    console.log(`[process:prep] Generating prep for ${pdfResult.sets.length} sets…`);
+    const prepStart = Date.now();
+    let prepMap: Record<string, string> = {};
+    try {
+      prepMap = await generatePrepForAllSets(pdfResult.sets, signal);
+      console.log(
+        `[process:prep] Done in ${Date.now() - prepStart}ms — ` +
+        `got=${Object.keys(prepMap).length}/${pdfResult.sets.length}  keys=${JSON.stringify(Object.keys(prepMap))}`,
+      );
+    } catch (prepErr) {
+      if (prepErr instanceof Error && prepErr.name === 'AbortError') {
+        return NextResponse.json({ error: 'Cancelled.' }, { status: 499 });
+      }
+      console.error('[process:prep] Prep generation failed (non-fatal):', prepErr);
+    }
+
+    const setsWithPrep: ExtractedHardwareSet[] = pdfResult.sets.map(set => ({
+      ...set,
+      prep: prepMap[set.setName],
+    }));
+
+    // ── Phase 2: Persist — all DB writes in one pass after AI succeeds ─────
+    // Final signal check before touching the database.
+    if (signal.aborted) return NextResponse.json({ error: 'Cancelled.' }, { status: 499 });
+
+    // Step 2a: Persist door schedule ───────────────────────────────────────
+    const { data: scheduleData, error: scheduleError } = await upsertDoorScheduleImport(projectId, {
+      scheduleJson: scheduleResult.rows,
+      fileName: scheduleField.name,
+      uploadedBy: ctx.user.id,
+    });
+
+    if (scheduleError) {
+      return NextResponse.json({ error: scheduleError.message }, { status: 500 });
+    }
+
+    invalidateDoorSchedule(projectId);
+
+    // Step 2b: Persist PDF extraction ──────────────────────────────────────
+    const { data: pdfData, error: pdfError } = await upsertHardwarePdfExtraction(projectId, {
+      extractedJson: setsWithPrep,
+      fileName: pdfFileName,
+      uploadedBy: ctx.user.id,
+    });
+
+    if (pdfError) {
+      return NextResponse.json({ error: pdfError.message }, { status: 500 });
+    }
+
+    // Step 2c: Queue new unique items for master hardware DB approval ───────
+    console.log(`[process:master] PDF extracted sets=${setsWithPrep.length}  items=${pdfResult.itemCount}`);
+    const candidateItems = setsWithPrep
+      .flatMap(set =>
+        (set.hardwareItems ?? []).map(item => ({
+          name: (item.item ?? '').trim(),
+          manufacturer: (item.manufacturer ?? '').trim(),
+          description: (item.description ?? '').trim(),
+          finish: (item.finish ?? '').trim(),
+        })),
+      )
+      .filter(item => item.name.length > 0);
+
+    console.log(`[process:master] Candidate items after filter: ${candidateItems.length}`);
+
+    let masterQueueWarning: string | null = null;
+    if (candidateItems.length > 0) {
+      const queueResult = await queueItemsForApproval(
+        candidateItems,
+        projectId,
+        pdfFileName,
+        ctx.user.id,
+      );
+      if (queueResult.data) {
+        console.log(`[process:master] Queued ${queueResult.data.queued} new items, skipped ${queueResult.data.skipped} duplicates.`);
+      } else {
+        masterQueueWarning = queueResult.error?.message ?? 'Unknown queue error';
+        console.error('[process:master] queueItemsForApproval error:', masterQueueWarning);
+      }
+    } else {
+      masterQueueWarning = 'No queue candidates were generated from the extracted hardware items.';
+      console.warn('[process:master] No candidate items — check that hardwareItems[].item field is populated.');
+    }
+
+    // Step 2d: Merge ────────────────────────────────────────────────────────
+    const mergeResult = mergeHardwareData(setsWithPrep, scheduleResult.rows, projectId);
+
+    // Step 2e: Persist merged final JSON ────────────────────────────────────
+    const { error: finalError } = await upsertProjectHardwareFinal(projectId, {
+      finalJson: mergeResult.sets,
+      pdfExtractionId: pdfData!.id,
+      doorScheduleId: scheduleData!.id,
+      generatedBy: ctx.user.id,
+    });
+
+    if (finalError) {
+      return NextResponse.json({ error: finalError.message }, { status: 500 });
+    }
+
+    // ── Step 3: Return stats ───────────────────────────────────────────────
+    return NextResponse.json({
+      data: {
+        setCount: mergeResult.setCount,
+        matchedDoorCount: mergeResult.matchedDoorCount,
+        unmatchedDoorCount: mergeResult.unmatchedDoorCount,
+        unmatchedDoorCodes: mergeResult.unmatchedDoorCodes,
+        pdfSetsWithNoDoors: mergeResult.pdfSetsWithNoDoors,
+        masterQueueWarning,
+        warnings: [...scheduleResult.warnings, ...pdfResult.warnings, ...mergeResult.warnings],
+        rowCount: scheduleResult.rowCount,
+        itemCount: pdfResult.itemCount,
+      },
+    });
+    } finally {
+      // Runs on every exit path: success, validation error, AI error, and user cancel.
+      // This guarantees the project is never permanently locked.
+      await releaseProcessingLock(projectId, lockId);
+      // Delete the temp PDF from Supabase Storage (large-file path only).
+      // Wrapped in its own try/catch so a cleanup failure never changes the response.
+      if (tempPdfStoragePath) {
+        try {
+          const adminClient = createSupabaseAdminClient();
+          await adminClient.storage.from('temp-pdf-uploads').remove([tempPdfStoragePath]);
+        } catch (cleanupErr) {
+          console.warn('[process] Failed to delete temp PDF from storage:', cleanupErr);
+        }
+      }
+    }
+  },
+);

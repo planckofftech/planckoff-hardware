@@ -1,0 +1,125 @@
+<!--
+  PlanckOff Invite User — Supabase Email Template
+  ================================================
+  Paste this entire file into:
+    Supabase Dashboard → Authentication → Email Templates → Invite User
+    (the "Message body" / HTML editor)
+
+  Subject line to set in the same screen:
+    You have been invited to PlanckOff
+
+  Template variables used (provided by Supabase):
+    {{ .ConfirmationURL }}    — accept-invite link (Supabase generates this)
+    {{ .Data.name }}          — recipient name        (passed via emailService.ts)
+    {{ .Data.role }}          — invited role          (passed via emailService.ts)
+    {{ .Data.inviterName }}   — who is inviting them  (passed via emailService.ts; '' if absent,
+                                handled by the {{ if }} conditional in the body)
+
+  Before pasting:
+    - Make sure https://planckoff.ai/set-password is added to
+      Supabase → Authentication → URL Configuration → Redirect URLs.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>You've been invited to PlanckOff</title>
+</head>
+<body style="margin:0;padding:0;background-color:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background-color:#f1f5f9;padding:48px 16px;">
+    <tr>
+      <td align="center">
+        <table width="560" cellpadding="0" cellspacing="0" role="presentation" style="max-width:560px;width:100%;">
+
+          <!-- Wordmark -->
+          <tr>
+            <td style="padding:0 8px 24px;text-align:center;">
+              <span style="font-size:22px;font-weight:700;letter-spacing:-0.5px;color:#0f172a;">Planck<span style="color:#2563eb;">Off</span></span>
+            </td>
+          </tr>
+
+          <!-- Card -->
+          <tr>
+            <td style="background-color:#ffffff;border-radius:16px;border:1px solid #e2e8f0;padding:48px;">
+              <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
+
+                <tr>
+                  <td style="padding-bottom:8px;">
+                    <span style="display:inline-block;padding:6px 14px;border-radius:999px;background-color:#eff6ff;color:#1d4ed8;font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;">
+                      Team Invitation
+                    </span>
+                  </td>
+                </tr>
+
+                <tr>
+                  <td style="padding:16px 0 12px;">
+                    <h1 style="margin:0;font-size:26px;line-height:1.3;font-weight:700;letter-spacing:-0.5px;color:#0f172a;">
+                      Hi {{ .Data.name }}, welcome aboard.
+                    </h1>
+                  </td>
+                </tr>
+
+                <tr>
+                  <td style="padding-bottom:32px;">
+                    <p style="margin:0;font-size:16px;line-height:1.7;color:#475569;">
+                      {{ if .Data.inviterName }}<strong style="color:#0f172a;">{{ .Data.inviterName }}</strong> has invited you to join{{ else }}You have been invited to join{{ end }}
+                      <strong style="color:#0f172a;">PlanckOff</strong> as
+                      a&nbsp;<strong style="color:#0f172a;">{{ .Data.role }}</strong> — set your password to get started.
+                    </p>
+                  </td>
+                </tr>
+
+                <!-- CTA Button -->
+                <tr>
+                  <td align="center" style="padding-bottom:32px;">
+                    <table cellpadding="0" cellspacing="0" role="presentation">
+                      <tr>
+                        <td style="background-color:#2563eb;border-radius:10px;">
+                          <a href="{{ .ConfirmationURL }}" style="display:inline-block;padding:15px 40px;color:#ffffff;font-size:16px;font-weight:600;letter-spacing:0.2px;text-decoration:none;border-radius:10px;">
+                            Accept Invitation
+                          </a>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+
+                <!-- Divider -->
+                <tr>
+                  <td style="border-top:1px solid #e2e8f0;padding-top:24px;">
+                    <p style="margin:0 0 6px;font-size:13px;line-height:1.6;color:#94a3b8;">
+                      Button not working? Copy this link into your browser:
+                    </p>
+                    <p style="margin:0 0 24px;font-size:13px;line-height:1.6;word-break:break-all;">
+                      <a href="{{ .ConfirmationURL }}" style="color:#2563eb;text-decoration:none;">{{ .ConfirmationURL }}</a>
+                    </p>
+                    <p style="margin:0;font-size:13px;line-height:1.6;color:#94a3b8;">
+                      This invitation expires in 7 days. If you weren't expecting it, you can safely ignore this email.
+                    </p>
+                  </td>
+                </tr>
+
+              </table>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding:28px 8px 0;text-align:center;">
+              <p style="margin:0 0 6px;font-size:12px;line-height:1.6;color:#94a3b8;">
+                Need help? Reach us at
+                <a href="mailto:tech@planckoff.com" style="color:#2563eb;text-decoration:none;">tech@planckoff.com</a>
+              </p>
+              <p style="margin:0;font-size:12px;line-height:1.6;color:#cbd5e1;">
+                PlanckOff — Hardware Estimating Platform
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

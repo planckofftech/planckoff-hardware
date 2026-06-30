@@ -1,0 +1,5 @@
+{
+  "name": "PlanckOff -  Hardware Estimating ",
+  "description": "Hardware Estimating",
+  "requestFramePermissions": ["camera"]
+}
