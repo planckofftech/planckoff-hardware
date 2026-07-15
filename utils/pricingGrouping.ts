@@ -19,6 +19,8 @@ export const DOOR_FIELD_DEFS = [
 
 export const FRAME_FIELD_DEFS = [
   { key: 'frameMaterial',      label: 'Frame Material'     },
+  { key: 'width',              label: 'Width'              },
+  { key: 'height',             label: 'Height'             },
   { key: 'throatThickness',    label: 'Throat Thickness'   },
   { key: 'frameGauge',         label: 'Frame Gauge'        },
   { key: 'frameAssembly',      label: 'Frame Assembly'     },
@@ -94,8 +96,13 @@ export function extractDoorFields(door: Door): Record<string, string> {
 
 export function extractFrameFields(door: Door): Record<string, string> {
   // transformDoors already resolves all top-level frame fields correctly.
+  const raw = door.sections as unknown as Record<string, Record<string, string | undefined>> | undefined;
+  const bi = raw?.basic_information;
+  const d  = raw?.door;
   return {
     frameMaterial:      String(door.frameMaterial  ?? '').trim(),
+    width:              (bi?.['WIDTH']            ?? bi?.['DOOR WIDTH'] ?? d?.['WIDTH'] ?? d?.['DOOR WIDTH'] ?? '').trim(),
+    height:             (bi?.['HEIGHT']           ?? bi?.['DOOR HEIGHT'] ?? d?.['HEIGHT'] ?? d?.['DOOR HEIGHT'] ?? '').trim(),
     throatThickness:    (door.throatThickness      ?? '').trim(),
     frameGauge:         (door.frameGauge           ?? '').trim(),
     frameAssembly:      (door.frameAssembly        ?? '').trim(),
