@@ -1,4 +1,5 @@
 import type { Door, HardwareSet, HardwareItem } from '../../../types';
+import { computeItemTotalQty } from '@/utils/hardwareQuantity';
 
 /** Grouping mode key for the hardware-set report. */
 export type GroupByOption = 'set' | 'type' | 'manufacturer' | 'flat' | 'buildingTag' | 'buildingLocation' | 'doorMaterial';
@@ -120,8 +121,10 @@ export function buildSetGroups(hardwareSets: HardwareSet[], doors: Door[]): Hard
       const items: HardwareItemUsage[] = set.items.map(item => ({
         item,
         doorTags,
-        // multipliedQuantity from the final JSON = qty × door count for this set
-        totalQuantity: item.multipliedQuantity ?? item.quantity,
+        // Derived from the set's physical door count (Σ QUANTITY, excludes
+        // dropped) rather than the persisted multipliedQuantity, which is a
+        // merge-time snapshot taken before the exclude filter was applied.
+        totalQuantity: computeItemTotalQty(item, setDoors),
         sets: [set.name],
         doorQuantitySum: groupTotalQuantity,
         doorMaterials,

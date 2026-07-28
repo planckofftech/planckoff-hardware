@@ -21,6 +21,7 @@ import {
 } from './hardwareHelpers';
 import { HardwareGroupTable } from './HardwareGroupTable';
 import { buildExportFilename } from '../../../utils/exportFilename';
+import { computeItemTotalQty } from '@/utils/hardwareQuantity';
 
 // ─── Exported types (kept for downstream services) ───────────────────────────
 
@@ -79,9 +80,10 @@ const HardwareSetConfig: React.FC<HardwareSetConfigProps> = ({
             if (mat && !usage.doorMaterials.includes(mat)) usage.doorMaterials.push(mat);
           }
         });
-        // Sum multipliedQuantity (qty × door count for this set), falling back to
-        // qty × matched door count if multipliedQuantity isn't available.
-        usage.totalQuantity += item.multipliedQuantity ?? (item.quantity * doorsWithSet.length);
+        // Derived, never read from the persisted multipliedQuantity: that value
+        // was computed at merge time over ALL assigned doors (including
+        // hardware-EXCLUDE ones) and goes stale when doors are reassigned.
+        usage.totalQuantity += computeItemTotalQty(item, doorsWithSet);
         if (!usage.sets.includes(set.name)) usage.sets.push(set.name);
       });
     });
