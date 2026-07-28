@@ -1,4 +1,5 @@
 import type { Door, HardwareSet, HardwareItem } from '@/types';
+import { getDoorQty, computeItemTotalQty } from '@/utils/hardwareQuantity';
 
 // ─── Field definitions (order controls Description display) ──────────────────
 
@@ -159,11 +160,8 @@ export function buildDescription(
 }
 
 // ─── Door qty helper ──────────────────────────────────────────────────────────
-
-function getDoorQty(door: Door): number {
-  // transformDoors parses QUANTITY from basic_information or door section already
-  return door.quantity != null && door.quantity > 0 ? door.quantity : 1;
-}
+// Re-exported from utils/hardwareQuantity so doors, frames and hardware all
+// multiply by the same definition of "a door".
 
 // ─── Variant group builder ────────────────────────────────────────────────────
 
@@ -343,7 +341,10 @@ export function groupHardwareItems(
       }
 
       const group = map.get(key)!;
-      const multipliedQty = item.quantity * Math.max(setDoors.length, 1);
+      // Multiply by PHYSICAL doors (Σ QUANTITY), not schedule-row count — a row
+      // with QUANTITY 3 needs 3× the hardware. Matches groupDoors/groupFrames,
+      // which have always used getDoorQty.
+      const multipliedQty = computeItemTotalQty(item, setDoors);
 
       group.sets.push({ setName: set.name, setId: set.id, multipliedQty });
       group.totalQty += multipliedQty;
@@ -405,7 +406,7 @@ export function filterDoorGroups(
       );
     });
     if (matching.length === 0) continue;
-    const qty = matching.reduce((s, d) => s + (d.quantity != null && d.quantity > 0 ? d.quantity : 1), 0);
+    const qty = matching.reduce((s, d) => s + getDoorQty(d), 0);
     result.push({
       ...g,
       doors:      matching,

@@ -21,6 +21,7 @@ import type {
   MergedDoor,
 } from '@/lib/db/hardware';
 import { resolveAllMergedSets } from '@/utils/descriptionResolver';
+import { getMergedSetDoorQty } from '@/utils/hardwareQuantity';
 
 // ---------------------------------------------------------------------------
 // Public result type
@@ -365,10 +366,9 @@ export function mergeHardwareData(
   // Build the final merged array — one entry per PDF set
   const sets: MergedHardwareSet[] = pdfSets.map((pdfSet) => {
     const assignedDoors = doorsBySet.get(pdfSet.setName) ?? [];
-    const doorCount = assignedDoors.reduce((sum, d) => {
-      const qty = parseInt(d.sections?.basic_information?.['QUANTITY'] ?? d.sections?.door?.['QUANTITY'] ?? String(d.quantity ?? 1)) || 1;
-      return sum + qty;
-    }, 0);
+    // Hardware-EXCLUDE doors stay in `doors` (they belong to the set) but must
+    // NOT inflate hardware quantities — they receive no hardware.
+    const doorCount = getMergedSetDoorQty(assignedDoors);
     return {
       setName: pdfSet.setName,
       hardwareItems: pdfSet.hardwareItems.map((item) => ({

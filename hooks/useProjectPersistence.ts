@@ -6,6 +6,7 @@ import type { MergedHardwareSet, MergedDoor, TrashItem } from '@/lib/db/hardware
 import { captureTrainingExample } from '../services/mlOpsService';
 import type { SaveStatus } from '../components/shared/SaveStatusIndicator';
 import { GENERAL_ERRORS } from '@/constants/errors';
+import { getMergedSetDoorQty } from '@/utils/hardwareQuantity';
 
 interface UseProjectPersistenceOptions {
     projectId: string;
@@ -84,10 +85,11 @@ export function useProjectPersistence({
                     sections: syncedSections(d),
                 }));
 
-                const doorCount = mergedDoors.reduce((sum, d) => {
-                    const qty = parseInt(d.sections?.door?.['QUANTITY'] ?? String(d.quantity ?? 1)) || 1;
-                    return sum + qty;
-                }, 0);
+                // Same helper the merge uses — reads basic_information.QUANTITY
+                // first and drops hardware-EXCLUDE doors, so a client save can
+                // no longer rewrite multipliedQuantity to a different number
+                // than the server merge produced.
+                const doorCount = getMergedSetDoorQty(mergedDoors);
                 return {
                     setName: set.name,
                     isManualEntry: set.isManualEntry === true,
