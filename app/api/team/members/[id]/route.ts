@@ -56,6 +56,20 @@ export const DELETE = withRoleAuth(
       );
     }
 
+    // Administrators are never deleted — demote them first, or deactivate via
+    // /status. Enforced here and not only in the UI, since the UI check is
+    // just a hidden button.
+    const { data: member, error: fetchError } = await getTeamMemberById(id);
+    if (fetchError || !member) {
+      return NextResponse.json({ error: 'Member not found.' }, { status: 404 });
+    }
+    if (member.role === 'Administrator') {
+      return NextResponse.json(
+        { error: 'Administrators cannot be deleted. Change their role first, or set them Inactive.' },
+        { status: 403 },
+      );
+    }
+
     // Remove live sessions first so the user is signed out immediately
     // and the team_members row has no dependent auth_sessions rows.
     await deleteAllSessionsForUser(id, 'team_member');

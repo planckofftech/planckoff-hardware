@@ -233,6 +233,36 @@ export async function deleteTeamMember(id: string): Promise<DbResult<boolean>> {
   }
 }
 
+/**
+ * Number of Administrators who can currently sign in.
+ *
+ * Guards every operation that could remove the last one — demotion,
+ * deactivation and delete. Without this, an Administrator can lock the whole
+ * organisation out of Team Management with a single click and there is no
+ * in-app way back in.
+ *
+ * `excludeId` omits the member being acted on, so callers can ask "how many
+ * Administrators would remain if I changed this one?".
+ */
+export async function countActiveAdministrators(excludeId?: string): Promise<DbResult<number>> {
+  try {
+    const db = createSupabaseAdminClient();
+    let query = db
+      .from('team_members')
+      .select('id, roles!inner ( name )', { count: 'exact', head: false })
+      .eq('status', 'Active')
+      .eq('roles.name', 'Administrator');
+
+    if (excludeId) query = query.neq('id', excludeId);
+
+    const { data, error } = await query;
+    if (error) return { data: null, error: { message: error.message } };
+    return { data: (data ?? []).length, error: null };
+  } catch (err) {
+    return { data: null, error: { message: String(err) } };
+  }
+}
+
 /** Unified member shape for UI display (admins + team_members). */
 export interface UnifiedMember {
   id: string;

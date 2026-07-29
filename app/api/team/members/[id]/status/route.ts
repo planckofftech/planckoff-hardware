@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { withRoleAuth } from '@/lib/auth/api-helpers';
 import type { AuthContext, RouteParams } from '@/lib/auth/api-helpers';
-import { getTeamMemberById, updateTeamMember } from '@/lib/db/team';
+import { getTeamMemberById, updateTeamMember, countActiveAdministrators } from '@/lib/db/team';
 import { deleteAllSessionsForUser } from '@/lib/db/auth';
 
 interface StatusBody {
@@ -58,11 +58,22 @@ export const PATCH = withRoleAuth(
       );
     }
 
-    if (member.role === 'Administrator') {
-      return NextResponse.json(
-        { error: 'Administrator accounts cannot be deactivated.' },
-        { status: 403 },
-      );
+    // Administrators can be deactivated, but never the last active one —
+    // that would leave nobody able to manage the team or reverse it.
+    if (member.role === 'Administrator' && nextStatus === 'Inactive') {
+      const { data: remaining, error: countError } = await countActiveAdministrators(id);
+      if (countError) {
+        return NextResponse.json(
+          { error: 'Could not verify Administrator count.' },
+          { status: 500 },
+        );
+      }
+      if ((remaining ?? 0) === 0) {
+        return NextResponse.json(
+          { error: 'This is the last active Administrator. Promote someone else first.' },
+          { status: 400 },
+        );
+      }
     }
 
     const { data, error } = await updateTeamMember(id, { status: nextStatus });
