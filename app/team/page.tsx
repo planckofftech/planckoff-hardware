@@ -192,8 +192,9 @@ export default function TeamPage() {
   const [resendFeedback, setResendFeedback] = useState<Record<string, ResendFeedback>>({});
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  // Admin-only moderation state (activate/deactivate + delete)
+  // Admin-only moderation state (activate/deactivate + role change + delete)
   const [togglingId, setTogglingId] = useState<string | null>(null);
+  const [changingRoleId, setChangingRoleId] = useState<string | null>(null);
   const [memberToDelete, setMemberToDelete] = useState<UnifiedMember | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [actionError, setActionError] = useState<Record<string, string>>({});
@@ -297,6 +298,35 @@ export default function TeamPage() {
       }));
     } finally {
       setTogglingId(null);
+    }
+  };
+
+  const handleChangeRole = async (member: UnifiedMember, nextRole: RoleName) => {
+    if (member.role === nextRole) return;
+    setChangingRoleId(member.id);
+    setActionError(prev => {
+      const next = { ...prev };
+      delete next[member.id];
+      return next;
+    });
+
+    try {
+      const res = await fetch(`/api/team/members/${member.id}/role`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ role: nextRole }),
+      });
+      const json = (await res.json()) as { error?: string };
+      if (!res.ok) throw new Error(json.error ?? 'Failed to update role.');
+      await fetchMembers();
+    } catch (err) {
+      setActionError(prev => ({
+        ...prev,
+        [member.id]: err instanceof Error ? err.message : 'Failed to update role.',
+      }));
+    } finally {
+      setChangingRoleId(null);
     }
   };
 
@@ -449,8 +479,19 @@ export default function TeamPage() {
                             const showResend         = canManageTeam && member.status === 'Invited' && member.source === 'team_member';
                             const showChangePassword = isAdmin && member.status === 'Active';
                             const canModerate        = isAdmin && member.source === 'team_member' && !isCurrentUser;
-                            const showStatusDropdown = canModerate && member.status !== 'Invited' && member.role !== 'Administrator';
+                            // Administrators can now be deactivated and demoted; the
+                            // last-active-Administrator guard lives server-side.
+                            const showStatusToggle   = canModerate && member.status !== 'Invited';
+                            // Role is the one control that applies to yourself too. Status
+                            // and Delete stay off-limits on your own row: deactivating
+                            // yourself logs you out with no way back, whereas a demotion is
+                            // reversible by any other Administrator.
+                            const showRoleMenu       = isAdmin && member.source === 'team_member';
+                            // Delete is for non-Administrators only — demote first,
+                            // or set them Inactive. Also enforced in the API.
+                            const showDelete         = canModerate && member.role !== 'Administrator';
                             const isToggling         = togglingId === member.id;
+                            const isChangingRole     = changingRoleId === member.id;
                             const memberActionError  = actionError[member.id];
 
                             return (
@@ -473,7 +514,48 @@ export default function TeamPage() {
 
                                   {/* Status + resend controls */}
                                   <div className="flex items-center gap-2 flex-shrink-0">
-                                    <StatusBadge status={member.status} expiresAt={member.inviteExpiresAt} />
+                                    {/* The status chip IS the control — click it to pick the
+                                        other state. Falls back to a plain badge when the
+                                        current user can't moderate this row. */}
+                                    {showStatusToggle ? (
+                                      <DropdownMenu>
+                                        <DropdownMenuTrigger
+                                          disabled={isToggling}
+                                          title="Change status"
+                                          className="rounded disabled:opacity-50 disabled:pointer-events-none hover:opacity-80 transition-opacity"
+                                        >
+                                          {isToggling
+                                            ? <span className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-[var(--text-muted)] bg-[var(--bg-muted)] border border-[var(--border)] px-2 py-0.5 rounded">
+                                                <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                                                Saving
+                                              </span>
+                                            : <StatusBadge status={member.status} expiresAt={member.inviteExpiresAt} />
+                                          }
+                                        </DropdownMenuTrigger>
+                                        <DropdownMenuContent align="end" className="min-w-[130px]">
+                                          <DropdownMenuItem
+                                            disabled={member.status === 'Active'}
+                                            onClick={() => handleChangeStatus(member, 'Active')}
+                                            className="gap-2 text-xs text-[var(--success-text)] focus:text-[var(--success-text)]"
+                                          >
+                                            <UserCheck className="w-3.5 h-3.5" />
+                                            Active
+                                            {member.status === 'Active' && <Check className="w-3 h-3 ml-auto" />}
+                                          </DropdownMenuItem>
+                                          <DropdownMenuItem
+                                            disabled={member.status === 'Inactive'}
+                                            onClick={() => handleChangeStatus(member, 'Inactive')}
+                                            className="gap-2 text-xs text-red-600 dark:text-red-400 focus:text-red-600 dark:focus:text-red-400"
+                                          >
+                                            <UserX className="w-3.5 h-3.5" />
+                                            Inactive
+                                            {member.status === 'Inactive' && <Check className="w-3 h-3 ml-auto" />}
+                                          </DropdownMenuItem>
+                                        </DropdownMenuContent>
+                                      </DropdownMenu>
+                                    ) : (
+                                      <StatusBadge status={member.status} expiresAt={member.inviteExpiresAt} />
+                                    )}
 
                                     {/* Details button — admin only, not for self */}
                                     {isAdmin && !isCurrentUser && (
@@ -513,43 +595,36 @@ export default function TeamPage() {
                                       </button>
                                     )}
 
-                                    {showStatusDropdown && (
+                                    {showRoleMenu && (
                                       <DropdownMenu>
                                         <DropdownMenuTrigger
-                                          disabled={isToggling}
-                                          title="Change status"
+                                          disabled={isChangingRole}
+                                          title="Change role"
                                           className="flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-medium border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--primary-text)] hover:border-[var(--primary-border)] hover:bg-[var(--primary-bg-hover)] disabled:opacity-50 disabled:pointer-events-none transition-colors"
                                         >
-                                          {isToggling
+                                          {isChangingRole
                                             ? <Loader2 className="w-3 h-3 animate-spin" />
                                             : <ChevronDown className="w-3 h-3" />
                                           }
-                                          {isToggling ? 'Saving…' : 'Status'}
+                                          {isChangingRole ? 'Saving…' : member.role}
                                         </DropdownMenuTrigger>
-                                        <DropdownMenuContent align="end" className="min-w-[140px]">
-                                          <DropdownMenuItem
-                                            disabled={member.status === 'Active'}
-                                            onClick={() => handleChangeStatus(member, 'Active')}
-                                            className="gap-2 text-xs"
-                                          >
-                                            <UserCheck className="w-3.5 h-3.5 text-[var(--success-text)]" />
-                                            Active
-                                            {member.status === 'Active' && <Check className="w-3 h-3 ml-auto" />}
-                                          </DropdownMenuItem>
-                                          <DropdownMenuItem
-                                            disabled={member.status === 'Inactive'}
-                                            onClick={() => handleChangeStatus(member, 'Inactive')}
-                                            className="gap-2 text-xs"
-                                          >
-                                            <UserX className="w-3.5 h-3.5 text-[var(--warning-text)]" />
-                                            Inactive
-                                            {member.status === 'Inactive' && <Check className="w-3 h-3 ml-auto" />}
-                                          </DropdownMenuItem>
+                                        <DropdownMenuContent align="end" className="min-w-[150px]">
+                                          {ROLE_GROUPS.map(({ role }) => (
+                                            <DropdownMenuItem
+                                              key={role}
+                                              disabled={member.role === role}
+                                              onClick={() => handleChangeRole(member, role)}
+                                              className="gap-2 text-xs"
+                                            >
+                                              {role}
+                                              {member.role === role && <Check className="w-3 h-3 ml-auto" />}
+                                            </DropdownMenuItem>
+                                          ))}
                                         </DropdownMenuContent>
                                       </DropdownMenu>
                                     )}
 
-                                    {canModerate && (
+                                    {showDelete && (
                                       <button
                                         onClick={() => setMemberToDelete(member)}
                                         title="Remove this member from the platform"
