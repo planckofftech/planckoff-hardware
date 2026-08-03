@@ -29,7 +29,13 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 });
   }
 
-  const { email, password } = body;
+  // Emails are stored lowercase and looked up with `=`, which is case-sensitive
+  // in Postgres. Without normalising here, "Devang.s@Planckoff.com" finds no row
+  // and the user gets "Invalid email or password" despite a correct password.
+  // /api/auth/forgot-password already does this, which is why a reset email
+  // could arrive for an address that could not log in.
+  const email = body.email?.trim().toLowerCase();
+  const { password } = body;
   if (!email || !password) {
     return NextResponse.json({ error: 'Email and password are required.' }, { status: 400 });
   }

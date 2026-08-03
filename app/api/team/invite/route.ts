@@ -41,7 +41,12 @@ export const POST = withRoleAuth(
       return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 });
     }
 
-    const { name, email, role, projectIds } = body;
+    const { name, role, projectIds } = body;
+    // Store lowercase. Email lookups use `=`, which is case-sensitive in
+    // Postgres, so an address saved as "John.S@planckoff.com" could neither log
+    // in nor be found by /api/auth/forgot-password (that route lowercases what
+    // the user types). Normalising on the way in keeps every lookup working.
+    const email = body.email?.trim().toLowerCase();
     if (!name || !email || !role) {
       return NextResponse.json({ error: 'name, email, and role are required.' }, { status: 400 });
     }
